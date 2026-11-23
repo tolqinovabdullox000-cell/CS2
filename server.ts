@@ -171,6 +171,10 @@ async function startServer() {
   const httpServer = http.createServer(app);
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, ws: true });
+  });
+
   app.get('/api/rooms/:code', (req, res) => {
     const code = String(req.params.code || '').trim().toUpperCase();
     const room = rooms.get(code);

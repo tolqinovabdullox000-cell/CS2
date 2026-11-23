@@ -9,6 +9,7 @@ import type {
   RoomState,
   ServerToClientMessage,
 } from '../types/multiplayer';
+import { P2PRoomTransport } from './p2pRoomBroker';
 
 export interface MultiplayerCallbacks {
   onRoomJoined?: (clientId: string, room: RoomState) => void;
@@ -48,6 +49,8 @@ function getOrCreateClientId(): string {
 
 export class MultiplayerClient {
   private ws: WebSocket | null = null;
+  private p2p: P2PRoomTransport | null = null;
+  private transport: 'ws' | 'p2p' | null = null;
   private connecting: Promise<void> | null = null;
   private callbacks: MultiplayerCallbacks = {};
   public readonly clientId: string;
@@ -60,17 +63,51 @@ export class MultiplayerClient {
     this.callbacks = cb;
   }
 
+  public getTransportMode(): 'ws' | 'p2p' | null {
+    return this.transport;
+  }
+
   public isConnected(): boolean {
+    if (this.transport === 'p2p') {
+      return this.p2p?.isConnected() ?? false;
+    }
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
-  public async connect(): Promise<void> {
-    if (this.isConnected()) return;
+  private async hasLocalWebSocketServer(): Promise<boolean> {
+    const customWs = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_WS_URL;
+    if (customWs && customWs.trim().length > 0) {
+      return true;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 1400);
+    try {
+      const res = await fetch('/api/health', {
+        method: 'GET',
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok) return false;
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) return false;
+      const data = (await res.json()) as { ok?: boolean; ws?: boolean };
+      return Boolean(data?.ok && data?.ws);
+    } catch {
+      return false;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  private connectWebSocket(): Promise<void> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
     if (this.connecting) return this.connecting;
 
     this.connecting = new Promise<void>((resolve, reject) => {
+      const customWs = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_WS_URL;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${protocol}//${window.location.host}/ws`;
+      const url = customWs && customWs.trim().length > 0 ? customWs.trim() : `${protocol}//${window.location.host}/ws`;
       const socket = new WebSocket(url);
       this.ws = socket;
 
@@ -80,11 +117,12 @@ export class MultiplayerClient {
           this.connecting = null;
           reject(new Error('WebSocket connection timeout'));
         }
-      }, 6000);
+      }, 4500);
 
       socket.onopen = () => {
         window.clearTimeout(timeout);
         this.connecting = null;
+        this.transport = 'ws';
         resolve();
       };
 
@@ -106,11 +144,49 @@ export class MultiplayerClient {
       socket.onclose = () => {
         this.ws = null;
         this.connecting = null;
-        this.callbacks.onDisconnect?.();
+        if (this.transport === 'ws') {
+          this.callbacks.onDisconnect?.();
+        }
       };
     });
 
     return this.connecting;
+  }
+
+  private ensureP2PTransport(): P2PRoomTransport {
+    if (!this.p2p) {
+      this.p2p = new P2PRoomTransport(
+        this.clientId,
+        (msg) => this.handleMessage(msg),
+        () => {
+          if (this.transport === 'p2p') {
+            this.callbacks.onDisconnect?.();
+          }
+        }
+      );
+    }
+    this.transport = 'p2p';
+    return this.p2p;
+  }
+
+  public async connect(): Promise<'ws' | 'p2p'> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.transport = 'ws';
+      return 'ws';
+    }
+
+    const wsAvailable = await this.hasLocalWebSocketServer();
+    if (wsAvailable) {
+      try {
+        await this.connectWebSocket();
+        return 'ws';
+      } catch {
+        // Fall through to WebRTC P2P when WS upgrade is blocked (e.g. static/serverless hosts)
+      }
+    }
+
+    this.ensureP2PTransport();
+    return 'p2p';
   }
 
   private handleMessage(msg: ServerToClientMessage) {
@@ -152,16 +228,20 @@ export class MultiplayerClient {
   }
 
   public send(msg: ClientToServerMessage) {
+    if (this.transport === 'p2p' && this.p2p) {
+      this.p2p.send(msg);
+      return;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
   }
 
   public async createRoom(profile: PlayerProfile, mapId: MapId, mode: GameMode, fillBots = 0) {
-    await this.connect();
+    const modeUsed = await this.connect();
     const weaponId = profile.preferredPrimary || WeaponId.AK47;
     const skinId = profile.equippedSkins[weaponId] || SkinId.STANDARD;
-    this.send({
+    const createMsg: Extract<ClientToServerMessage, { type: 'room:create' }> = {
       type: 'room:create',
       player: {
         clientId: this.clientId,
@@ -175,14 +255,21 @@ export class MultiplayerClient {
       mapId,
       mode,
       fillBots,
-    });
+    };
+
+    if (modeUsed === 'p2p') {
+      await this.ensureP2PTransport().createRoom(createMsg);
+      return;
+    }
+
+    this.send(createMsg);
   }
 
   public async joinRoom(code: string, profile: PlayerProfile) {
-    await this.connect();
+    const modeUsed = await this.connect();
     const weaponId = profile.preferredPrimary || WeaponId.AK47;
     const skinId = profile.equippedSkins[weaponId] || SkinId.STANDARD;
-    this.send({
+    const joinMsg: Extract<ClientToServerMessage, { type: 'room:join' }> = {
       type: 'room:join',
       code: code.trim().toUpperCase(),
       player: {
@@ -194,10 +281,23 @@ export class MultiplayerClient {
         weaponId,
         skinId,
       },
-    });
+    };
+
+    if (modeUsed === 'p2p') {
+      await this.ensureP2PTransport().joinRoom(joinMsg);
+      return;
+    }
+
+    this.send(joinMsg);
   }
 
   public leaveRoom() {
+    if (this.transport === 'p2p' && this.p2p) {
+      this.p2p.send({ type: 'room:leave' });
+      const broker = this.p2p;
+      window.setTimeout(() => broker.cleanup(), 40);
+      return;
+    }
     this.send({ type: 'room:leave' });
   }
 
@@ -213,13 +313,26 @@ export class MultiplayerClient {
     this.send({ type: 'room:start' });
   }
 
-  public sendGrenade(grenadeId: GrenadeId, pos: [number, number, number], vel: [number, number, number], detonateDelayMs: number) {
+  public sendGrenade(
+    grenadeId: GrenadeId,
+    pos: [number, number, number],
+    vel: [number, number, number],
+    detonateDelayMs: number
+  ) {
     this.send({ type: 'player:grenade', grenadeId, pos, vel, detonateDelayMs });
   }
 
   public dispose() {
-    this.leaveRoom();
-    this.ws?.close();
-    this.ws = null;
+    if (this.p2p) {
+      this.p2p.send({ type: 'room:leave' });
+      this.p2p.cleanup();
+      this.p2p = null;
+    }
+    if (this.ws) {
+      this.send({ type: 'room:leave' });
+      this.ws.close();
+      this.ws = null;
+    }
+    this.transport = null;
   }
 }
