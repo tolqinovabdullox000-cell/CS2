@@ -1,0 +1,6 @@
+{
+  "name": "StrikeFront 2",
+  "description": "Modern CS2-inspired 3D tactical first-person shooter with custom 3D maps, PBR weapons, smart bots, loadout skins, and player identity customization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
